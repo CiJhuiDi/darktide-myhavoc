@@ -9,7 +9,11 @@ return {
     },
     command_description = {
         en      = "Send your current Havoc order to chat.",
-        ["zh-cn"] = "把自己的当前浩劫任务(层数、地图、词条)发到聊天。",
+        ["zh-cn"] = "把自己的当前浩劫任务（层数、地图、词条）发到聊天。",
+    },
+    command_description_start = {
+        en      = "Quick-start your own Havoc mission (activate order + start matchmaking).",
+        ["zh-cn"] = "快速开始自己的浩劫任务（激活订单并开始匹配）。",
     },
     msg_havoc_order = {
         en      = "[Havoc] Rank {rank} | {map} | {mods}",
@@ -42,5 +46,21 @@ return {
     err_send_failed = {
         en      = "[myhavoc] Failed to send message.",
         ["zh-cn"] = "[myhavoc] 消息发送失败。",
+    },
+    started = {
+        en      = "[myhavoc] Havoc mission started!",
+        ["zh-cn"] = "[myhavoc] 浩劫任务已开始！",
+    },
+    err_activate_failed = {
+        en      = "[myhavoc] Failed to activate Havoc order.",
+        ["zh-cn"] = "[myhavoc] 激活浩劫订单失败。",
+    },
+    err_ongoing_mission = {
+        en      = "[myhavoc] You have an ongoing mission, cancel it first.",
+        ["zh-cn"] = "[myhavoc] 已有进行中的任务，请先取消。",
+    },
+    err_start_failed = {
+        en      = "[myhavoc] Failed to start the mission.",
+        ["zh-cn"] = "[myhavoc] 启动任务失败。",
     },
 }

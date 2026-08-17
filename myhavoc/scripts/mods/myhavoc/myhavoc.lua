@@ -1,7 +1,7 @@
 --[[
     Name: myhavoc
     Author: CiJhuiDi
-    Version: 1.0.0
+    Version: 1.1.0
 
     聊天命令 /myhavoc:把自己的当前浩劫(Havoc)任务(层数 + 地图 + 词条)发到聊天,
     方便向队友展示本周浩劫任务。
@@ -154,3 +154,86 @@ local function send_my_havoc()
 end
 
 mod:command("myhavoc", mod:localize("command_description"), send_my_havoc)
+
+-- ########################## 快速开始自己的浩劫任务 ##########################
+-- 链路与游戏内浩劫面板"开始"按钮一致(havoc_play_view._cb_on_mission_start)：
+--   有 ongoing_mission_id 直接用；否则 activate_havoc_mission(order.id) 激活
+--   → party_immaterium:wanted_mission_selected(mission_id, private, region) 启动匹配
+local function start_my_havoc()
+	local svc
+	pcall(function() svc = Managers.data_service and Managers.data_service.havoc end)
+	if not svc or type(svc.current_order) ~= "function" then
+		mod:echo(mod:localize("err_no_service"))
+		return
+	end
+
+	local ok, promise = pcall(svc.current_order, svc)
+	if not (ok and type(promise) == "table" and type(promise.next) == "function") then
+		mod:echo(mod:localize("err_fetch_failed"))
+		return
+	end
+
+	promise:next(function(order)
+		if type(order) ~= "table" then
+			mod:echo(mod:localize("err_no_order"))
+			return
+		end
+
+		-- 1. 拿可启动的 mission id（有 ongoing 直接复用，否则激活订单）
+		local activate_promise
+
+		if order.ongoing_mission_id then
+			activate_promise = Promise.resolved({ id = order.ongoing_mission_id })
+		elseif order.id and type(svc.activate_havoc_mission) == "function" then
+			local ok2, p2 = pcall(svc.activate_havoc_mission, svc, order.id)
+
+			if not (ok2 and type(p2) == "table" and type(p2.next) == "function") then
+				mod:echo(mod:localize("err_activate_failed"))
+				return
+			end
+
+			activate_promise = p2
+		else
+			mod:echo(mod:localize("err_activate_failed"))
+			return
+		end
+
+		activate_promise:next(function(mission)
+			if not (mission and mission.id) then
+				mod:echo(mod:localize("err_activate_failed"))
+				return
+			end
+
+			-- 2. 启动匹配（与浩劫面板一致：公开匹配 + 首选区域）
+			local private_match = false
+			local prefered_mission_region
+
+			pcall(function()
+				prefered_mission_region = Managers.data_service.region_latency:get_prefered_mission_region()
+			end)
+
+			local ok3 = pcall(function()
+				Managers.party_immaterium:wanted_mission_selected(mission.id, private_match, prefered_mission_region)
+			end)
+
+			if ok3 then
+				mod:echo(mod:localize("started"))
+			else
+				mod:echo(mod:localize("err_start_failed"))
+			end
+		end):catch(function(err)
+			-- 已有进行中任务的 400 特判（与游戏内提示一致）
+			if err and err.code == 400 and type(err.description) == "string"
+				and string.find(err.description, "already_has_ongoing_mission")
+			then
+				mod:echo(mod:localize("err_ongoing_mission"))
+			else
+				mod:echo(mod:localize("err_activate_failed"))
+			end
+		end)
+	end):catch(function()
+		mod:echo(mod:localize("err_fetch_failed"))
+	end)
+end
+
+mod:command("havocstart", mod:localize("command_description_start"), start_my_havoc)
