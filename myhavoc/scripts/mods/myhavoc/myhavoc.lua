@@ -1,6 +1,6 @@
 --[[
     Name: myhavoc
-    Author: 大肥鱼
+    Author: CiJhuiDi
     Version: 1.0.0
 
     聊天命令 /myhavoc:把自己的当前浩劫(Havoc)任务(层数 + 地图 + 词条)发到聊天,
