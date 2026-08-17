@@ -4,8 +4,8 @@ return {
         ["zh-cn"] = "我的浩劫",
     },
     mod_description = {
-        en      = "Send your current Havoc order (rank, map and modifiers) to party chat with /myhavoc.",
-        ["zh-cn"] = "在聊天栏输入 /myhavoc,把自己的当前浩劫任务(层数、地图、词条)发送到队伍聊天。",
+        en      = "Send your current Havoc order (rank, map and modifiers) to party chat with /myhavoc, and quick-start it with /havocstart.",
+        ["zh-cn"] = "聊天命令：/myhavoc 把自己的当前浩劫任务（层数、地图、词条）发到队伍聊天；/havocstart 一键开始自己的浩劫任务。",
     },
     command_description = {
         en      = "Send your current Havoc order to chat.",

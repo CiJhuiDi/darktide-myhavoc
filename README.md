@@ -1,15 +1,14 @@
 # darktide-myhavoc
 
-暗潮(Warhammer 40,000: Darktide)Mod:在游戏聊天栏输入 `/myhavoc`,把自己的当前浩劫(Havoc)任务——**层数、地图、词条**——发送到聊天,方便向队友展示。
+暗潮(Warhammer 40,000: Darktide)Mod:浩劫(Havoc)任务工具——`/myhavoc` 把自己的当前浩劫任务(层数、地图、词条)发到聊天展示给队友,`/havocstart` 一键开始自己的浩劫任务。
 
-> Darktide mod: type `/myhavoc` in chat to send your current Havoc order (rank, map, modifiers) to your strike team.
+> Darktide mod: `/myhavoc` sends your current Havoc order (rank, map, modifiers) to party chat; `/havocstart` quick-starts your own Havoc mission.
 
 ## 功能 / Features
 
-- 聊天命令 `/myhavoc`:一键把当前浩劫任务发到聊天(层数 + 地图 + 词条)
-- 发送优先级:队伍聊天 → 任务聊天 → 枢纽聊天
+- 聊天命令 `/myhavoc`:把当前浩劫任务发到聊天(层数 + 地图 + 词条)
+- 聊天命令 `/havocstart`:一键开始自己的浩劫任务(激活订单 + 启动匹配,与浩劫面板「开始」同链路;已有进行中任务会提示先取消)
 - 词条与地图名跟随游戏语言(中文客户端显示中文,英文显示英文)
-- 没有浩劫任务时给出友好提示,不会崩
 - 需要 [Darktide Mod Framework (DMF)](https://github.com/Darktide-Mod-Framework/Darktide-Mod-Framework)
 
 ## 安装 / Install
@@ -23,7 +22,8 @@
 游戏内按回车打开聊天栏,输入:
 
 ```
-/myhavoc
+/myhavoc        # 发送自己的浩劫任务信息到聊天
+/havocstart     # 一键开始自己的浩劫任务
 ```
 
 中文客户端示例输出:
@@ -37,6 +37,11 @@ English example:
 ```
 [Havoc] Rank 26 | Hab Dreyko | Ventilation Purge, Lights Out
 ```
+
+## 更新记录 / Changelog
+
+- **v1.1.0**:新增 `/havocstart` 一键开始自己的浩劫任务(激活订单 + 启动匹配)
+- **v1.0.0**:首个版本,`/myhavoc` 发送浩劫任务信息到聊天
 
 ## 鸣谢 / Credits
 
