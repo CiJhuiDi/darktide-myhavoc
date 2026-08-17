@@ -1,0 +1,5 @@
+# 发布物不打进源码仓库(GitHub Release 放 zip)
+*.zip
+*.rar
+__pycache__/
+*.pyc
