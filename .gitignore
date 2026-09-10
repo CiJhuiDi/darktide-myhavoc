@@ -3,3 +3,8 @@
 *.rar
 __pycache__/
 *.pyc
+
+# 内部文档：不进公开仓（本地保留）
+PROJECT_HANDOFF.md
+# 内部文档：不进公开仓（本地保留）
+开发文档.md
