@@ -46,3 +46,7 @@ English example:
 ## 鸣谢 / Credits
 
 数据来源与渲染思路参考 Wobin 的开源项目 [Havoc Auspex](https://github.com/Wobin/HavocAuspex) / Havoc Auspex Transmitter。
+
+## 许可 / License
+
+MIT License —— 详见 [LICENSE](LICENSE)。
