@@ -1,4 +1,4 @@
-myhavoc 1.1.0 - 浩劫任务 Mod(暗潮 Darktide)
+myhavoc 1.3.1 - 浩劫任务 Mod(暗潮 Darktide)
 ================================================
 
 功能
@@ -7,6 +7,10 @@ myhavoc 1.1.0 - 浩劫任务 Mod(暗潮 Darktide)
   方便向队友展示:层数、地图、词条。
 - 在聊天栏输入 /havocstart,一键快速开始自己的浩劫任务
   (激活订单 + 启动匹配,与浩劫面板"开始"按钮同链路)。
+- 设置里的「调试模式」默认关闭:关闭时不显示「已发送到聊天」「订单无变化」
+  这类冗余回显;失败提示(如人数不够、队友没到位)始终显示。排查问题时打开它。
+- 在聊天栏输入 /havocprobe,诊断用:把浩劫配置和后端原始返回 dump 到
+  %APPDATA%/Fatshark/Darktide/myhavoc_probe.txt
 
 示例输出(中文客户端):
   [浩劫] 第26层 | 德雷科定居点 | 通风净化、灯火管制
@@ -15,7 +19,7 @@ myhavoc 1.1.0 - 浩劫任务 Mod(暗潮 Darktide)
 ----
 方式一(DMM 管理器,推荐):
   1. 打开 Darktide Mod Manager
-  2. 导入本 zip(myhavoc_1.0.0.zip)
+  2. 导入本 zip(myhavoc_1.3.1.zip)
   3. 在模组列表启用 myhavoc
 
 方式二(手动):
@@ -26,8 +30,16 @@ myhavoc 1.1.0 - 浩劫任务 Mod(暗潮 Darktide)
 ----
   1. 游戏内进入枢纽站(接了浩劫任务后)
   2. 按回车打开聊天栏,输入 /myhavoc 回车 → 消息会发到队伍聊天(发自己任务信息)
+- 每局结束会自动把当前浩劫订单发到聊天(省得每次手打 /myhavoc)。
+  结算画面出现后约 6 秒再发(等后端结算新订单),提前离开结算画面则立刻发。
+  可在 DMF 设置里关掉,或关掉"仅在订单变化时发送"改为每局都发。
+
+使用
+----
+  1. 游戏内进入枢纽站(接了浩劫任务后)
+  2. 按回车打开聊天栏,输入 /myhavoc 回车 → 消息会发到队伍聊天(发自己任务信息)
   3. 输入 /havocstart 回车 → 直接开始自己的浩劫任务(有进行中任务会提示先取消)
-  4. 本地会收到 [myhavoc] 已发送/已开始 的反馈
+  4. 输入 /havocprobe 回车 → 生成诊断文件(排查用)
 
 说明与限制
 ----------
@@ -35,11 +47,15 @@ myhavoc 1.1.0 - 浩劫任务 Mod(暗潮 Darktide)
   没有时会提示"当前没有浩劫任务"
 - 词条/地图名跟随游戏语言(中文客户端显示中文,英文显示英文)
 - 发送频道优先级:队伍(PARTY) > 任务(MISSION) > 枢纽(HUB)
+- /havocstart 与官方浩劫面板同规则:自己必须在枢纽站(队友可以在灵能室),
+  有队友还在加载/在任务中会被拒绝并提示(否则会把他一起拉进任务,导致其客户端黑屏);
+  浩劫不自动匹配,至少需要 2 人,单人会被拒绝
 - 卸载:在 DMM 里删除,或删掉 mods/myhavoc 文件夹并移除 load order 行
 
 技术说明
 --------
-- 数据来源:Managers.data_service.havoc:current_order()
+- 数据来源:
+  /myhavoc   -> Managers.data_service.havoc:current_order()
 - 词条:circumstance_templates 的 ui.display_name 本地化
-- 发送:Managers.chat:send_channel_message
+- 发送:Managers.chat:send_channel_message(localize/echo 走本地私聊频道)
 - 参考实现:Wobin 的 Havoc Auspex / Havoc Auspex Transmitter(开源)

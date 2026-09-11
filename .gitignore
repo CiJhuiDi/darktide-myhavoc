@@ -8,3 +8,6 @@ __pycache__/
 PROJECT_HANDOFF.md
 # 内部文档：不进公开仓（本地保留）
 开发文档.md
+
+# 备份文件：本地保留，不进仓库
+*.bak_*
