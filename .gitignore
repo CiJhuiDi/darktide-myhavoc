@@ -11,3 +11,4 @@ PROJECT_HANDOFF.md
 
 # 备份文件：本地保留，不进仓库
 *.bak_*
+release/
