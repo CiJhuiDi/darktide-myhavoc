@@ -16,8 +16,8 @@ return {
         ["zh-cn"] = "快速开始自己的浩劫任务（激活订单并开始匹配）。",
     },
     msg_havoc_order = {
-        en      = "[Havoc] Rank {rank} | {map} | {mods}",
-        ["zh-cn"] = "[浩劫] 第{rank}层 | {map} | {mods}",
+        en      = "{time}[Havoc] Rank {rank} | {map} | {mods}",
+        ["zh-cn"] = "{time}[浩劫] 第{rank}层 | {map} | {mods}",
     },
     sent = {
         en      = "[myhavoc] Sent to chat:",
@@ -126,5 +126,9 @@ return {
     debug_mode_description = {
         en      = "Show local echo for redundant / automatic messages (e.g. \"sent to chat\", \"order unchanged\"). Errors and explicit command feedback are always shown.",
         ["zh-cn"] = "显示「已发送到聊天」「订单无变化」这类冗余/自动回显。失败提示与手动命令的反馈不受此开关影响，始终显示。",
+    },
+    auto_send_not_havoc = {
+        en      = "[myhavoc] Not a Havoc mission; auto-send skipped.",
+        ["zh-cn"] = "[myhavoc] 本局不是浩劫任务，自动发送已跳过。",
     },
 }

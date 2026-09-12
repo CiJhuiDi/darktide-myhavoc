@@ -72,13 +72,37 @@ local function map_name(map_id)
     return prettify(map_id)
 end
 
--- 组装聊天文本(模板在 localization 里,{rank}/{map}/{mods} 占位)
+-- 当前本地时间，返回 "[10:35] "；取不到时返回空串（消息照常发，不因为拿不到时间就失败）
+local function now_stamp()
+    local fmt = "%H:%M"
+    local ok, value = pcall(function () return os.date(fmt) end)
+
+    if not (ok and type(value) == "string") then
+        -- 兜底：某些环境全局 os 拿不到，从 Mods.lua 取（同 probe 的写法）
+        ok, value = pcall(function ()
+            return get_mod("DMF").deepcopy(Mods.lua.os).date(fmt)
+        end)
+    end
+
+    if ok and type(value) == "string" then
+        return "[" .. value .. "] "
+    end
+
+    return ""
+end
+
+-- 组装聊天文本(模板在 localization 里,{time}/{rank}/{map}/{mods} 占位)
+-- {time} 自带方括号与尾空格；取不到时间时是空串，模板里不会留下空括号
 local function build_message(order)
     local rank = tostring(order.rank or "?")
     local circs = parse_circumstances(order.flags)
     local mods_text = #circs > 0 and table.concat(circs, ", ") or "-"
     local map = map_name(order.map) or "?"
-    return mod:localize("msg_havoc_order"):gsub("{rank}", rank):gsub("{map}", map):gsub("{mods}", mods_text)
+    return mod:localize("msg_havoc_order")
+        :gsub("{time}", now_stamp())
+        :gsub("{rank}", rank)
+        :gsub("{map}", map)
+        :gsub("{mods}", mods_text)
 end
 
 -- 找可发送的聊天频道:优先队伍(PARTY),其次任务(MISSION),最后枢纽(HUB)
@@ -198,8 +222,81 @@ mod:command("myhavoc", mod:localize("command_description"), send_my_havoc)
 -- 触发：结算画面(EndView)出现后等 AUTO_SEND_DELAY 秒再发（等后端结算新订单）；
 --       提前离开结算画面时由 on_exit 立即发（兜底）。
 -- 开关：auto_send_after_mission（默认开）；auto_send_only_if_changed（默认开，订单没变不刷屏）
+-- 只在**浩劫局**结束后发：普通任务结束同样会进 EndView，但那时订单没变，发了就是刷屏
 
 local AUTO_SEND_DELAY = 6
+
+-- 是不是浩劫局（不是就别在结算时自动播报浩劫订单）
+--
+-- **在任务初始化那一刻记录**，而不是等 EndView 再现场判断：
+--   游戏自己在开局就把答案给了 ——
+--     gameplay_init_step_managers.lua L98:
+--       Managers.state.difficulty = DifficultyManager:new(is_server, resistance, challenge, havoc_data)
+--     difficulty_manager.lua L19-24:
+--       if havoc_data then self._parsed_havoc_data = Havoc.parse_data(havoc_data) end
+--   即只有浩劫局才传 havoc_data。
+--   现场判断不可靠：EndView 触发时局内 manager 可能已经拆掉，一律判成"不是浩劫"
+--   → 连浩劫局都不播报（2026-09-12 实测踩到）。
+local _havoc_hook_ok = false
+
+do
+    local DifficultyManager
+    local ok, mod_table = pcall(require, "scripts/managers/difficulty/difficulty_manager")
+
+    if ok and type(mod_table) == "table" then
+        DifficultyManager = mod_table
+    elseif type(CLASSES) == "table" then
+        DifficultyManager = CLASSES.DifficultyManager
+    end
+
+    if type(DifficultyManager) == "table" then
+        _havoc_hook_ok = pcall(function ()
+            mod:hook(DifficultyManager, "init", function (func, self, is_server, resistance, challenge, havoc_data)
+                mod._session_havoc = havoc_data ~= nil
+
+                return func(self, is_server, resistance, challenge, havoc_data)
+            end)
+        end)
+    end
+end
+
+-- 诊断串：调试模式下随跳过提示一起输出，下一次出问题一眼定位
+local function havoc_diag()
+    local ok1, v1 = pcall(function ()
+        return Managers.state.difficulty:get_parsed_havoc_data()
+    end)
+    local ok2, v2 = pcall(function ()
+        return Managers.state.game_mode:game_mode():extension("havoc"):get_current_rank()
+    end)
+
+    return string.format("(hooked=%s captured=%s diff=%s gm=%s)",
+        tostring(_havoc_hook_ok),
+        tostring(mod._session_havoc),
+        ok1 and tostring(v1 ~= nil) or "ERR",
+        ok2 and tostring(v2 ~= nil) or "ERR")
+end
+
+local function is_havoc_mission()
+    -- 开局记下的结果说了算
+    if mod._session_havoc ~= nil then
+        return mod._session_havoc == true
+    end
+
+    -- 兜底：hook 没挂上（找不到类表）时只能现场判断
+    local ok, value = pcall(function ()
+        return Managers.state.difficulty:get_parsed_havoc_data() ~= nil
+    end)
+
+    if ok and value then
+        return true
+    end
+
+    ok, value = pcall(function ()
+        return Managers.state.game_mode:game_mode():extension("havoc"):get_current_rank() ~= nil
+    end)
+
+    return ok and value == true
+end
 
 local function auto_send_run()
     if mod._auto_fired then return end
@@ -207,6 +304,13 @@ local function auto_send_run()
     mod._auto_fired = true
 
     if mod:get("auto_send_after_mission") == false then return end
+
+    -- 普通任务结束也会走到这里，但不是浩劫局就别发（订单根本没变化，纯刷屏）
+    if not is_havoc_mission() then
+        echo_debug(mod:localize("auto_send_not_havoc") .. " " .. havoc_diag())
+
+        return
+    end
 
     send_my_havoc({
         filter = function (signature)
