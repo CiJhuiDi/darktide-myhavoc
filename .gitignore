@@ -12,3 +12,7 @@ PROJECT_HANDOFF.md
 # 备份文件：本地保留，不进仓库
 *.bak_*
 release/
+
+# 移除代码的本地归档：不进公开仓
+# （旧版本 Release zip 里也能取回，见 开发文档.md）
+archive/

@@ -78,7 +78,7 @@ local function now_stamp()
     local ok, value = pcall(function () return os.date(fmt) end)
 
     if not (ok and type(value) == "string") then
-        -- 兜底：某些环境全局 os 拿不到，从 Mods.lua 取（同 probe 的写法）
+        -- 兜底：某些环境全局 os 拿不到，从 Mods.lua 取（同下方落盘 dump 的写法）
         ok, value = pcall(function ()
             return get_mod("DMF").deepcopy(Mods.lua.os).date(fmt)
         end)
@@ -144,7 +144,7 @@ end
 
 -- 调试模式：控制「冗余/自动回显」是否输出
 --   关（默认）：不显示「已发送到聊天」「订单无变化」这类噪音
---              —— 但失败提示（err_*）、/havocstart 的「已开始」、/havocprobe 的输出不受影响
+--              —— 但失败提示（err_*）、/havocstart 的「已开始」、诊断命令的输出不受影响
 --   开：全部输出
 local function debug_on()
     return mod:get("debug_mode") == true
@@ -215,7 +215,83 @@ local function send_my_havoc(hooks)
     end)
 end
 
-mod:command("myhavoc", mod:localize("command_description"), send_my_havoc)
+-- ########################## 命令参数解析（统一入口） ##########################
+-- DMF 把命令后空格分隔的参数以 vararg 传进来（见 DMF commands.lua / chat_actions.lua L127-136）。
+-- 统一成：第一个词当子命令（小写），raw 是完整参数串。
+-- 不接受参数的命令用它挡下多余参数 —— 避免打错字时静默执行正事（以前 /havocgroup chekc 会直接建房）。
+local function parse_command_args(...)
+	local raw = table.concat({ ... }, " ")
+	local first = raw:match("^%s*(%S*)") or ""
+
+	return first:lower(), raw
+end
+
+-- 有多余参数时提示用法并返回 true（调用方直接 return）
+local function reject_extra_args(raw, usage_key)
+	if raw:match("%S") then
+		mod:echo(mod:localize(usage_key))
+
+		return true
+	end
+
+	return false
+end
+
+-- ########################## 每帧回调（计时/延迟动作的公共入口） ##########################
+-- DMF 没有定时器 API。CLASS.InputManager.update 在任何场景（枢纽站/任务中）都每帧跑，
+-- DMF 自己也 hook 它（dmf_hooks.lua L575），是最可靠的每帧入口。
+local _tickers = {}
+local _frame_hook_installed = false
+
+local function frame_hook_install()
+	if _frame_hook_installed then
+		return true
+	end
+
+	local ok = pcall(function ()
+		mod:hook_safe(CLASS.InputManager, "update", function (self, dt)
+			for i = 1, #_tickers do
+				pcall(_tickers[i], dt or 0)
+			end
+		end)
+	end)
+
+	_frame_hook_installed = ok == true
+
+	return _frame_hook_installed
+end
+
+-- 通用落盘（游戏控制台看不到，方便排查）
+local function dump_to_file(name, text)
+	pcall(function ()
+		local DMF = get_mod("DMF")
+		local io_lib = DMF.deepcopy(Mods.lua.io)
+		local os_lib = DMF.deepcopy(Mods.lua.os)
+		local path = (os_lib.getenv("APPDATA") or "") .. "/Fatshark/Darktide/" .. name
+		local file = io_lib.open(path, "w+")
+
+		if file then
+			file:write(text)
+			file:close()
+		end
+	end)
+end
+
+-- /havoc 与 /myhavoc 同义。推荐 /havoc：前缀和 /havocstart /havocgroup 一致，
+-- DMF 的补全是按前缀列命令的，这样才能把最常用的动作也列进去。
+-- /myhavoc 保留为别名（早已写在 mod 简介里发出去过，不能废）。
+local function command_send_order(...)
+	local _, raw = parse_command_args(...)
+
+	if reject_extra_args(raw, "usage_send") then
+		return
+	end
+
+	send_my_havoc()
+end
+
+mod:command("havoc", mod:localize("command_description"), command_send_order)
+mod:command("myhavoc", mod:localize("command_description"), command_send_order)
 
 -- ########################## 每局结束自动发送浩劫订单 ##########################
 -- 打完一局队伍还在，顺手把（可能已刷新的）浩劫订单贴到聊天，省得每次手打 /myhavoc。
@@ -503,346 +579,852 @@ local function start_my_havoc()
 	end)
 end
 
-mod:command("havocstart", mod:localize("command_description_start"), start_my_havoc)
+local function command_start_havoc(...)
+	local _, raw = parse_command_args(...)
 
--- 客户端静态配置 HavocSettings（/havocprobe 用）
-local _havoc_settings = false
-
-local function havoc_settings()
-	if _havoc_settings ~= false then return _havoc_settings end
-
-	local ok, t = pcall(require, "scripts/settings/havoc_settings")
-	_havoc_settings = (ok and type(t) == "table") and t or nil
-
-	return _havoc_settings
-end
-
--- ########################## /havocprobe：数据探针（诊断用） ##########################
--- 把两份数据完整 dump 到文件，用来确认：
---   1) 客户端配置 HavocSettings 的真实结构 —— 核对 /havocpool 的字段假设
---   2) 后端 /data/havoc/settings 的原始返回 —— 客户端解析时只取了 rankSystem（最高等级/部署次数），
---      其余字段被丢弃；如果真的存在「每周轮换池」，只可能藏在这里
--- 输出文件：%APPDATA%/Fatshark/Darktide/myhavoc_probe.txt
-
-local _probe_io, _probe_os = nil, nil
-
--- 拿游戏沙箱的 io / os（与 scoreboard_fixes 同一套写法）
-local function probe_sandbox()
-	if _probe_io then return _probe_io, _probe_os end
-
-	local ok, DMF = pcall(get_mod, "DMF")
-
-	if not (ok and type(DMF) == "table" and type(DMF.deepcopy) == "function") then
-		return nil, nil
-	end
-
-	local ok_io, io_lib = pcall(function () return DMF.deepcopy(Mods.lua.io) end)
-	local ok_os, os_lib = pcall(function () return DMF.deepcopy(Mods.lua.os) end)
-
-	if ok_io and ok_os then
-		_probe_io, _probe_os = io_lib, os_lib
-	end
-
-	return _probe_io, _probe_os
-end
-
--- 递归序列化（带循环引用保护与长度上限）
-local function probe_dump(v, indent, seen, out, depth)
-	if #out > 40000 or depth > 12 then return end
-
-	if type(v) == "table" then
-		if seen[v] then
-			out[#out + 1] = indent .. "<循环引用>"
-			return
-		end
-
-		seen[v] = true
-		out[#out + 1] = indent .. "{"
-
-		local keys = {}
-
-		for k in pairs(v) do keys[#keys + 1] = k end
-
-		table.sort(keys, function (a, b) return tostring(a) < tostring(b) end)
-
-		for i = 1, #keys do
-			local k = keys[i]
-			local val = v[k]
-			local key = type(k) == "string" and k or ("[" .. tostring(k) .. "]")
-
-			if type(val) == "table" then
-				out[#out + 1] = indent .. "  " .. key .. " ="
-				probe_dump(val, indent .. "    ", seen, out, depth + 1)
-			else
-				out[#out + 1] = indent .. "  " .. key .. " = " .. tostring(val)
-			end
-		end
-
-		out[#out + 1] = indent .. "}"
-		seen[v] = nil
-	else
-		out[#out + 1] = indent .. tostring(v)
-	end
-end
-
-local function probe_top_keys(v)
-	local keys = {}
-
-	if type(v) == "table" then
-		for k in pairs(v) do keys[#keys + 1] = tostring(k) end
-		table.sort(keys)
-	end
-
-	return table.concat(keys, ", ")
-end
-
-local function probe_count(t)
-	local n = 0
-
-	if type(t) == "table" then
-		for _ in pairs(t) do n = n + 1 end
-	end
-
-	return n
-end
-
-local function probe_join_keys(t)
-	local keys = {}
-
-	if type(t) == "table" then
-		for k in pairs(t) do keys[#keys + 1] = tostring(k) end
-		table.sort(keys)
-	end
-
-	return table.concat(keys, ", ")
-end
-
--- 从一份 order 里抠出地图 id 与词条 id
-local function probe_order_bits(order)
-	local bp = type(order) == "table" and order.blueprint
-	local map_id
-
-	if type(bp) == "table" then
-		local t = bp.template
-
-		if type(t) == "table" and type(t.id) == "string" then
-			map_id = t.id
-		elseif type(t) == "string" then
-			map_id = t
-		elseif type(bp.map) == "string" then
-			map_id = bp.map
-		end
-	end
-
-	local circs = {}
-
-	if type(bp) == "table" and type(bp.flags) == "table" then
-		for k, v in pairs(bp.flags) do
-			local str = (type(k) == "string" and k) or (type(v) == "string" and v) or nil
-			local cid = str and str:match("^havoc%-circ%-(.+)$")
-
-			if cid then circs[#circs + 1] = cid end
-		end
-	end
-
-	return map_id, circs
-end
-
-local function run_havoc_probe()
-	local io_lib, os_lib = probe_sandbox()
-
-	if not io_lib then
-		mod:echo(mod:localize("probe_no_io"))
+	if reject_extra_args(raw, "usage_start") then
 		return
 	end
 
-	local out = {}
-	local function w(line) out[#out + 1] = line end
+	start_my_havoc()
+end
 
-	w("myhavoc probe")
-	w("")
+mod:command("havocstart", mod:localize("command_description_start"), command_start_havoc)
 
-	-- 1) 客户端配置
-	local HS = havoc_settings()
+-- ########################## 一键创建组队房间（/havocgroup） ##########################
+-- 按自己的浩劫订单在「寻找队伍」挂一条招募，别人能直接看到并申请加入。
+-- 逻辑照抄游戏自己的 group_finder_view（反编译存档：暗潮\99-临时文件\ref\src_group_finder_view.lua）：
+--   标签   = "my_havoc_order"（游戏原生标签，勾上就是"按我的浩劫订单"）
+--            + "havoc_order_threshold_<X>"（由订单 flags 里的 havoc-threshold- 推出）
+--   config = havoc_order_owner / havoc_order_id / havoc_order_rank /
+--            havoc_mission_template / havoc_circ_1..N / havoc_theme
+--   调用   Managers.party_immaterium:start_party_finder_advertise(config, tags, region)
+-- 原版是「打开寻找队伍界面 → 勾『我的浩劫订单』→ 点开始招募」，本命令省掉界面操作。
 
-	w("===== 1) HavocSettings =====")
-	w("顶层 key: " .. probe_top_keys(HS))
-	w("")
+local GROUP_FINDER_VIEW = "group_finder_view"
+local HAVOC_ORDER_TAG = "my_havoc_order"
 
-	if HS then
-		probe_dump(HS, "", {}, out, 1)
-	else
-		w("(读取失败 / 未加载)")
+-- 本机账号 id
+local function local_account_id()
+	local ok, account_id = pcall(function ()
+		local player = Managers.player:local_player(1) or Managers.player:local_player()
+
+		return player and player:account_id()
+	end)
+
+	return ok and account_id or nil
+end
+
+-- 自己是不是在枢纽站（寻找队伍是枢纽站功能，任务里挂招募没意义）
+local function myself_in_hub()
+	local ok, in_hub = pcall(function ()
+		return Managers.party_immaterium:get_myself():presence_name() == "hub"
+	end)
+
+	return ok and in_hub == true
+end
+
+-- 错误转文本（后端返回的错误常常是 table，直接 tostring 只有 "table: 0x..."）
+local function error_text(error)
+	if type(error) == "string" then
+		return error
 	end
 
-	w("")
+	local ok, text = pcall(function ()
+		return table.tostring(error, 10)
+	end)
 
-	-- 2) 客户端解析后的 settings
-	local svc = Managers.data_service and Managers.data_service.havoc
-	local parsed
-
-	w("===== 2) havoc:get_settings() =====")
-
-	if svc and type(svc.get_settings) == "function" then
-		local ok, res = pcall(svc.get_settings, svc)
-
-		if ok then
-			parsed = res
-			w("顶层 key: " .. probe_top_keys(parsed))
-			w("")
-			probe_dump(parsed, "", {}, out, 1)
-		else
-			w("(调用失败: " .. tostring(res) .. ")")
-		end
-	else
-		w("(不可用)")
+	if ok and type(text) == "string" then
+		return (text:gsub("%s+", " "))
 	end
 
-	w("")
+	return tostring(error)
+end
 
-	local finished = false
-	local function finish(extra)
-		if finished then return end
-		finished = true
+-- 失败详情落盘（游戏控制台看不到，方便排查）
+local function dump_group_error(error, config, tags, region)
+	pcall(function ()
+		local DMF = get_mod("DMF")
+		local io_lib = DMF.deepcopy(Mods.lua.io)
+		local os_lib = DMF.deepcopy(Mods.lua.os)
+		local path = (os_lib.getenv("APPDATA") or "") .. "/Fatshark/Darktide/myhavoc_group_error.txt"
+		local file = io_lib.open(path, "w+")
 
-		if extra then w(extra) end
-
-		local path = (os_lib.getenv("APPDATA") or "") .. "/Fatshark/Darktide/myhavoc_probe.txt"
-		local f, err = io_lib.open(path, "w+")
-
-		if not f then
-			mod:echo(mod:localize("probe_write_failed", tostring(err)))
+		if not file then
 			return
 		end
 
-		f:write(table.concat(out, "\n"))
-		f:close()
+		file:write("myhavoc /havocgroup 失败详情\n\n== error ==\n")
+		file:write(error_text(error) .. "\n")
+		file:write("\n== region ==\n" .. tostring(region) .. "\n")
+		file:write("\n== tags ==\n" .. table.concat(tags or {}, "\n") .. "\n")
+		file:write("\n== config ==\n")
 
-		mod:echo(mod:localize("probe_written", path))
-		mod:echo(mod:localize("probe_hs_keys", probe_top_keys(HS)))
-	end
+		for key, value in pairs(config or {}) do
+			file:write(string.format("%s = %s\n", tostring(key), tostring(value)))
+		end
 
-	-- 3.5) 任务板 mission_board（本周任务列表，含 flags）
-	local function mission_board()
-		w("")
-		w("===== 5) 任务板 mission_board =====")
+		file:write("\n== party ==\n")
 
-		local requested = false
-
-		pcall(function ()
-			local iface = Managers.backend and Managers.backend.interfaces
-			local mb = iface and iface.mission_board
-
-			if not (mb and type(mb.fetch) == "function") then return end
-
-			local promise = mb:fetch(nil, 1)
-
-			if not (type(promise) == "table" and type(promise.next) == "function") then return end
-
-			requested = true
-
-			promise:next(function (data)
-				w("body 顶层 key: " .. probe_top_keys(data))
-				w("missions 条数: " .. (type(data) == "table" and type(data.missions) == "table" and #data.missions or 0))
-				w("")
-				probe_dump(data, "", {}, out, 1)
-				finish()
-			end):catch(function (err)
-				finish("任务板请求失败: " .. tostring(err))
-			end)
+		local party = Managers.party_immaterium
+		local ok_leader, is_leader = pcall(function ()
+			return party.is_party_leader and party:is_party_leader() or "n/a"
 		end)
 
-		if not requested then
-			finish("(任务板不可用：backend.interfaces.mission_board.fetch 拿不到)")
+		file:write("party_id        = " .. tostring(party and party:party_id()) .. "\n")
+		file:write("is_party_leader = " .. (ok_leader and tostring(is_leader) or "ERR") .. "\n")
+		file:write("num_members     = " .. tostring(party and party.num_members and party:num_members()) .. "\n")
+		file:write("presence        = " .. tostring(party and party:get_myself() and party:get_myself():presence_name()) .. "\n")
+		file:close()
+	end)
+end
+
+-- 把 available_orders()[1] 组装成 config + 阈值标签；数据不完整返回 nil
+local function build_advertise_payload(order, account_id)
+	if type(order) ~= "table" then
+		return nil
+	end
+
+	local blueprint = order.blueprint or {}
+	local data = order.data or {}
+	local template = blueprint.template or {}
+	local flags = blueprint.flags or {}
+
+	local rank = data.rank and tostring(data.rank)
+	local mission_template = template.id
+
+	if not order.id or not rank or not mission_template or not next(flags) then
+		return nil
+	end
+
+	local config = {
+		havoc_order_owner = account_id,
+		havoc_order_id = order.id,
+		havoc_order_rank = rank,
+		havoc_mission_template = mission_template,
+	}
+
+	local threshold_tag
+	local circ_index = 1
+
+	for flag in pairs(flags) do
+		if type(flag) == "string" then
+			local circ = flag:match("^havoc%-circ%-(.+)$")
+			local theme = flag:match("^havoc%-theme%-(.+)$")
+			local threshold = flag:match("^havoc%-threshold%-(.+)$")
+
+			if circ then
+				config["havoc_circ_" .. circ_index] = circ
+				circ_index = circ_index + 1
+			elseif theme then
+				config.havoc_theme = theme
+			elseif threshold then
+				threshold_tag = threshold
+			end
 		end
 	end
 
-	-- 4) 后端原始 settings
-	local function backend_settings()
-		w("")
-		w("===== 4) 后端原始 /data/havoc/settings =====")
+	return config, threshold_tag
+end
 
-		local requested = false
+-- 把选中标签的**完整祖先链**补进列表（照抄 group_finder_view 的实际行为）
+-- 勾「我的浩劫订单」时，成品招募带的是 game_mode -> havoc -> 叶子 整条链。
+-- 缺了祖先，别人按常规筛选（浩劫分类）就搜不到我们的房间。
+-- 2026-09-13 实测踩坑：/havocgroup check 回查后端列表，别人都有 havoc+game_mode，只有我们没有。
+--
+-- 注意：**不能只加 root_tag 的父**。后端标签表（social:get_group_finder_tags）实际是：
+--   game_mode   rootTag=true
+--     havoc               parents=game_mode
+--       my_havoc_order           parents=havoc
+--       havoc_order_threshold_N  parents=havoc
+-- my_havoc_order 的父是 havoc，而 havoc 不是 rootTag ——
+-- 官方 L1666-1678 只加「父里 root_tag 的那些」，是建立在
+-- 「界面里勾叶子前必须先把祖先勾上」这一前提下的（所以原版 _selected_tags 里本来就有 havoc）。
+-- 我们直接调接口没这个前提，必须自己把祖先链补齐。
+-- 父关系由 unlocks 反向推（同 _format_group_finder_tags）；拿不到数据就不加（不阻断创建）。
+local function expand_parent_tags(tags, callback)
+	local social = Managers.data_service and Managers.data_service.social
 
-		pcall(function ()
-			local ok_req, BackendUtilities = pcall(require, "scripts/foundation/managers/backend/utilities/backend_utilities")
+	if not (social and social.get_group_finder_tags) then
+		callback(tags)
 
-			if not (ok_req and type(BackendUtilities) == "table") then return end
-			if not (Managers.backend and type(Managers.backend.title_request) == "function") then return end
-
-			local builder = BackendUtilities.url_builder():path("/data"):path("/havoc"):path("/settings")
-			local promise = Managers.backend:title_request(builder:to_string(), { method = "GET" })
-
-			if not (type(promise) == "table" and type(promise.next) == "function") then return end
-
-			requested = true
-
-			promise:next(function (data)
-				w("status = " .. tostring(data and data.status))
-				w("body 顶层 key: " .. probe_top_keys(data and data.body))
-				w("")
-				probe_dump(data, "", {}, out, 1)
-				mission_board()
-			end):catch(function (err)
-				w("请求失败: " .. tostring(err))
-				mission_board()
-			end)
-		end)
-
-		if not requested then
-			w("(无法发起请求：backend_utilities / title_request 不可用)")
-			mission_board()
-		end
+		return
 	end
 
-	-- 3) available_orders（本周可选的浩劫订单列表）
-	local function dump_orders(orders)
-		local maps, circs = {}, {}
-		local n = type(orders) == "table" and #orders or 0
+	local ok, promise = pcall(function ()
+		return social:get_group_finder_tags()
+	end)
 
-		if type(orders) == "table" then
-			for i = 1, #orders do
-				local map_id, list = probe_order_bits(orders[i])
+	if not (ok and promise) then
+		callback(tags)
 
-				if map_id then maps[map_id] = true end
+		return
+	end
 
-				for k = 1, #list do circs[list[k]] = true end
+	promise:next(function (data)
+		local list = data and data.tags and data.tags.tags
+
+		if type(list) ~= "table" then
+			callback(tags)
+
+			return
+		end
+
+		local parents_map = {}
+
+		for i = 1, #list do
+			local tag = list[i]
+
+			if type(tag) == "table" and type(tag.unlocks) == "table" then
+				for j = 1, #tag.unlocks do
+					local child = tag.unlocks[j]
+
+					parents_map[child] = parents_map[child] or {}
+					parents_map[child][#parents_map[child] + 1] = tag.name
+				end
 			end
 		end
 
-		w("===== 3) available_orders（本周可选的浩劫订单）=====")
-		w("订单数: " .. n)
-		w("地图数: " .. probe_count(maps))
-		w("  地图: " .. probe_join_keys(maps))
-		w("词条数: " .. probe_count(circs))
-		w("  词条: " .. probe_join_keys(circs))
-		w("")
-		probe_dump(orders, "", {}, out, 1)
+		local existing = {}
+		local queue = {}
 
-		mod:echo(mod:localize("probe_orders", n, probe_count(maps), probe_count(circs)))
+		for i = 1, #tags do
+			existing[tags[i]] = true
+			queue[#queue + 1] = tags[i]
+		end
 
-		backend_settings()
+		-- 广度优先沿父链往上走（existing 兼作去重与防环）
+		local index = 1
+
+		while index <= #queue do
+			local name = queue[index]
+			index = index + 1
+
+			local parents = parents_map[name]
+
+			if parents then
+				for j = 1, #parents do
+					local parent = parents[j]
+
+					if not existing[parent] then
+						existing[parent] = true
+						tags[#tags + 1] = parent
+						queue[#queue + 1] = parent
+					end
+				end
+			end
+		end
+
+		callback(tags)
+	end):catch(function ()
+		callback(tags)
+	end)
+end
+
+-- 拿地区 id；为空就先拉一次。
+-- BackendUtilities.prefered_mission_region 默认是 ""，只有 fetch_regions_latency 跑过才有值
+-- （游戏里进「寻找队伍」/任务板时会自己拉；直接敲命令就可能还是空 —— 空地区会被后端拒绝）
+local function resolve_region(callback)
+	local service = Managers.data_service.region_latency
+	local region = service and service:get_prefered_mission_region()
+
+	if type(region) == "string" and region ~= "" then
+		callback(region)
+
+		return
 	end
 
-	if svc and type(svc.available_orders) == "function" then
-		local ok, promise = pcall(svc.available_orders, svc)
+	local called = false
 
-		if ok and type(promise) == "table" and type(promise.next) == "function" then
-			promise:next(function (orders)
-				dump_orders(orders)
-			end):catch(function (err)
-				w("===== 3) available_orders =====")
-				w("(失败: " .. tostring(err) .. ")")
-				backend_settings()
-			end)
+	local function done()
+		if called then
+			return
+		end
+
+		called = true
+		callback(service and service:get_prefered_mission_region())
+	end
+
+	local ok, promise = pcall(function ()
+		return service:fetch_regions_latency()
+	end)
+
+	if not (ok and promise) then
+		done()
+
+		return
+	end
+
+	promise:next(done):catch(done)
+end
+
+-- 关掉自己的招募
+local function cancel_group_advertise()
+	local party = Managers.party_immaterium
+
+	if not (party and party.cancel_party_finder_advertise) then
+		mod:echo(mod:localize("err_no_service"))
+
+		return
+	end
+
+	local ok = pcall(function ()
+		party:cancel_party_finder_advertise()
+	end)
+
+	-- 成功只是“回显”，走调试开关；失败必须始终显示
+	if ok then
+		echo_debug(mod:localize("group_cancelled"))
+	else
+		mod:echo(mod:localize("group_cancel_failed"))
+	end
+end
+
+-- ########################## 创建后自动打开「寻找队伍」 ##########################
+-- 为什么不能直接在创建成功的 promise 回调里开：
+--   UIManager.open_view 有多条**静默失败**路径 ——
+--     ① ui_view_handler._open：视图已在活跃表里就直接 return（什么都不做），
+--        而 UIManager 不管里面成没成，一律 `return true`
+--     ② 视图正在关闭（closing）时 force_close 未必来得及清干净 → 又掉进 ①
+--     ③ view_is_available 不通过时只弹框、不返回原因（group_finder_view 带 killswitch
+--        = GameParameters.show_group_finder）
+--   而 promise 回调是在帧内更新中跑的，时机很敏感。
+--
+-- 实测（2026-09-14，用户反馈「重启游戏后第一次一定打不开」）：
+--   症状 = 界面**闪一下就没了**；游戏日志显示首次打开要现场加载视图关卡：
+--     [ScriptWorld] Registering level named: "content/levels/ui/group_finder/group_finder"
+--   并造成 168ms 卡顿（RI::wait_for_fence），紧接着界面被关掉。
+--   之后几次因为关卡已在内存里、没有这个卡顿，所以都正常 —— 这就是「只有第一次」的来源。
+--
+-- 做法：挂到下一帧再开 → 开完验证真的 active → 没成就在超时窗口内限流重试 →
+--      **开成之后还要守一会儿**：被关掉就再开（最多 GROUP_FINDER_MAX_REOPENS 次）
+--      → 彻底失败则明确提示 + 落盘诊断，不再静默。
+local GROUP_FINDER_OPEN_TIMEOUT = 5
+local GROUP_FINDER_WATCH_SECONDS = 0.8
+local GROUP_FINDER_MAX_REOPENS = 2
+local GROUP_FINDER_RETRY_INTERVAL = 0.15
+
+local _open_finder = {
+	log = {},
+	next_try = 0,
+	opened = false,
+	opened_t = nil,
+	pending = false,
+	reopens = 0,
+	t = 0,
+	tries = 0,
+}
+
+local function finder_log_push(line)
+	local log = _open_finder.log
+
+	log[#log + 1] = line
+
+	-- 只留最后 14 行
+	while #log > 14 do
+		table.remove(log, 1)
+	end
+end
+
+-- 拿视图状态；拿不到返回 nil
+local function finder_view_state()
+	local ui = Managers.ui
+
+	if not ui then
+		return nil
+	end
+
+	local ok, state = pcall(function ()
+		return {
+			available = ui:view_is_available(GROUP_FINDER_VIEW),
+			active = ui:view_active(GROUP_FINDER_VIEW),
+			closing = ui._view_handler and ui._view_handler:is_view_closing(GROUP_FINDER_VIEW),
+		}
+	end)
+
+	if ok and type(state) == "table" then
+		return state
+	end
+
+	return nil
+end
+
+-- 诊断串（失败时落盘，下一次出问题一眼定位）
+local function finder_diag()
+	local state = finder_view_state()
+	local parts = { "tries=" .. tostring(_open_finder.tries), "reopens=" .. tostring(_open_finder.reopens) }
+
+	if state then
+		parts[#parts + 1] = "available=" .. tostring(state.available)
+		parts[#parts + 1] = "active=" .. tostring(state.active)
+		parts[#parts + 1] = "closing=" .. tostring(state.closing)
+	else
+		parts[#parts + 1] = "state=nil"
+	end
+
+	pcall(function ()
+		parts[#parts + 1] = "gp_show_group_finder=" .. tostring(GameParameters and GameParameters.show_group_finder)
+	end)
+
+	return table.concat(parts, " ")
+end
+
+local function finder_dump_trace(header)
+	dump_to_file("myhavoc_openview_trace.txt", header .. "\n\n" .. table.concat(_open_finder.log, "\n") .. "\n")
+end
+
+local function finder_open_failed()
+	_open_finder.pending = false
+
+	local diag = finder_diag()
+
+	dump_to_file("myhavoc_openview_error.txt", "myhavoc 自动打开「寻找队伍」失败\n\n" .. diag .. "\n\n== 尝试轨迹 ==\n" .. table.concat(_open_finder.log, "\n") .. "\n")
+	mod:echo(mod:localize("group_open_view_failed"))
+	echo_debug("open_view diag = " .. diag)
+end
+
+-- 返回 true=现在是开着的；false=还没成，可重试；nil=重试也没意义（如 killswitch 关着）
+local function finder_open_step()
+	local state = finder_view_state()
+
+	if not state then
+		return false
+	end
+
+	-- 开关被关：重试无意义（每次都会弹一个不可用弹框），直接报
+	if state.available == false then
+		return nil
+	end
+
+	if state.active and not state.closing then
+		return true
+	end
+
+	-- 正在关闭：先强制关掉，下一拍再开
+	if state.closing then
+		pcall(function ()
+			Managers.ui:close_view(GROUP_FINDER_VIEW, true)
+		end)
+
+		return false
+	end
+
+	local called, opened = pcall(function ()
+		return Managers.ui:open_view(GROUP_FINDER_VIEW)
+	end)
+
+	if not (called and opened) then
+		return false
+	end
+
+	-- open_view 返回 true 也可能是静默 no-op，再确认一次
+	local after = finder_view_state()
+
+	return (after and after.active and not after.closing) and true or false
+end
+
+local function finder_open_tick(dt)
+	if not _open_finder.pending then
+		return
+	end
+
+	_open_finder.t = _open_finder.t + dt
+
+	if _open_finder.t < _open_finder.next_try then
+		return
+	end
+
+	_open_finder.next_try = _open_finder.t + GROUP_FINDER_RETRY_INTERVAL
+	_open_finder.tries = _open_finder.tries + 1
+
+	-- 开**之前**的状态（上次的 bug：记的是开之后的状态，等于没记）
+	local before = finder_view_state()
+	local active_before = (before and before.active and not before.closing) and true or false
+
+	local done = finder_open_step()
+
+	finder_log_push(string.format("t=%.2f try=%d 开前: active=%s closing=%s avail=%s -> 开后=%s", _open_finder.t, _open_finder.tries, tostring(before and before.active), tostring(before and before.closing), tostring(before and before.available), tostring(done)))
+
+	if done == nil then
+		finder_open_failed()
+
+		return
+	end
+
+	if done == true then
+		if not _open_finder.opened then
+			_open_finder.opened = true
+			_open_finder.opened_t = _open_finder.t
+
+			finder_log_push("  ^ 首次打开")
+		elseif not active_before then
+			-- 之前开成过，这一拍发现它没了 → 重开
+			_open_finder.reopens = _open_finder.reopens + 1
+
+			finder_log_push(string.format("  ^ 被关掉了，重开第 %d 次", _open_finder.reopens))
+		end
+
+		-- 守着：窗口内继续看它还在不在（首次那一下会被关卡加载的卡顿带崩，重开一次就好了）
+		local watching = (_open_finder.t - (_open_finder.opened_t or 0)) < GROUP_FINDER_WATCH_SECONDS
+		local can_reopen = _open_finder.reopens < GROUP_FINDER_MAX_REOPENS
+
+		if watching and can_reopen then
+			return
+		end
+
+		_open_finder.pending = false
+
+		finder_dump_trace(string.format("myhavoc 自动打开「寻找队伍」：成功（tries=%d, reopens=%d, t=%.2fs）", _open_finder.tries, _open_finder.reopens, _open_finder.t))
+
+		return
+	end
+
+	if _open_finder.t >= GROUP_FINDER_OPEN_TIMEOUT then
+		finder_open_failed()
+	end
+end
+
+-- 挂到下一帧再开（不在 promise 回调的帧内直接开）
+local function request_group_finder_open()
+	if not frame_hook_install() then
+		-- 装不上钩子就退回原来的做法：直接开一次，成不成随它
+		finder_open_step()
+
+		return
+	end
+
+	_open_finder.pending = true
+	_open_finder.t = 0
+	_open_finder.next_try = 0
+	_open_finder.tries = 0
+	_open_finder.opened = false
+	_open_finder.opened_t = nil
+	_open_finder.reopens = 0
+	_open_finder.log = {}
+end
+
+_tickers[#_tickers + 1] = finder_open_tick
+
+-- 一键创建
+local function create_group_advertise()
+	local party = Managers.party_immaterium
+
+	if not (party and party.start_party_finder_advertise) then
+		mod:echo(mod:localize("err_no_service"))
+
+		return
+	end
+
+	if not myself_in_hub() then
+		mod:echo(mod:localize("group_not_in_hub"))
+
+		return
+	end
+
+	-- 已经有招募了：不重复创建，直接把寻找队伍界面打开（用户 2026-09-14 定）
+	if party.is_party_advertisement_active and party:is_party_advertisement_active() then
+		-- 只是“已在进行中”的回显（界面会开出来），走调试开关
+		echo_debug(mod:localize("group_already_advertising"))
+		request_group_finder_open()
+
+		return
+	end
+
+	local havoc = Managers.data_service.havoc
+
+	if not (havoc and havoc.available_orders) then
+		mod:echo(mod:localize("err_no_service"))
+
+		return
+	end
+
+	local account_id = local_account_id()
+
+	if not account_id then
+		mod:echo(mod:localize("group_no_account"))
+
+		return
+	end
+
+	local function advertise(config, tags, region)
+		local call_ok, promise = pcall(function ()
+			return party:start_party_finder_advertise(config, tags, region)
+		end)
+
+		if not call_ok or not promise then
+			mod:echo(mod:localize("group_create_failed"))
 
 			return
 		end
+
+		-- 创建过程的回显同样只是“回声”（成功与否看界面/失败提示），走调试开关
+		echo_debug(mod:localize("group_creating", config.havoc_order_rank))
+
+		promise:next(function ()
+			echo_debug(mod:localize("group_created"))
+
+			if mod:get("group_open_view_after_create") ~= false then
+				request_group_finder_open()
+			end
+		end):catch(function (error)
+			dump_group_error(error, config, tags, region)
+			mod:echo(mod:localize("group_create_failed") .. " " .. error_text(error))
+		end)
 	end
 
-	w("===== 3) available_orders =====")
-	w("(不可用)")
-	backend_settings()
+	havoc:available_orders():next(function (orders)
+		local order = orders and orders[1]
+		local config, threshold_tag = build_advertise_payload(order, account_id)
+
+		if not config then
+			mod:echo(mod:localize("group_no_order"))
+
+			return
+		end
+
+		local tags = { HAVOC_ORDER_TAG }
+
+		if threshold_tag then
+			tags[#tags + 1] = threshold_tag
+		end
+
+		resolve_region(function (region)
+			expand_parent_tags(tags, function (final_tags)
+				echo_debug("group tags = " .. table.concat(final_tags, ", "))
+				advertise(config, final_tags, region)
+			end)
+		end)
+	end):catch(function ()
+		mod:echo(mod:localize("err_fetch_failed"))
+	end)
 end
 
-mod:command("havocprobe", mod:localize("command_description_probe"), run_havoc_probe)
+-- ########################## 招募自检（/havocgroup check） ##########################
+-- 「用命令挂的招募，别人在寻找队伍里找不到」有两种可能，看创建返回码分不出来：
+--   A. 后端压根没存下这条招募（参数/前后置问题）
+--   B. 存下了，但搜索条件不匹配（标签/地区筛选问题）
+-- 这里用后端自己的列表接口回查：拿自己的 party_id 去问「(region, 空标签) 有哪些招募」，
+-- 看自己在不在里面。走的是和寻找队伍界面完全相同的链路
+-- （group_finder_view._start_advertisements_stream → grpc:party_finder_list_advertisements_stream）。
+
+local VERIFY_SECONDS = 5
+
+local _verify = { installed = false, active = false, t = 0 }
+
+-- 自检输出落盘（与失败详情同目录，文件名区分）
+local function dump_verify(text)
+	dump_to_file("myhavoc_group_probe.txt", text)
+end
+
+-- 标签表原数据（名字 / rootTag / locked / 父标签）—— 核对「根父标签该不该加、加没加上」
+local function verify_tag_lines()
+	local lines = { "", "== group finder tags（* 是咱们用的） ==" }
+	local list = _verify.tag_list
+
+	if type(list) ~= "table" then
+		lines[#lines + 1] = "(拿不到标签表)"
+
+		return lines
+	end
+
+	local parents_map = {}
+
+	for i = 1, #list do
+		local tag = list[i]
+
+		if type(tag) == "table" and type(tag.unlocks) == "table" then
+			for j = 1, #tag.unlocks do
+				local child = tag.unlocks[j]
+
+				parents_map[child] = parents_map[child] or {}
+				parents_map[child][#parents_map[child] + 1] = tag.name
+			end
+		end
+	end
+
+	lines[#lines + 1] = "tag count = " .. tostring(#list)
+
+	for i = 1, #list do
+		local tag = list[i]
+
+		if type(tag) == "table" then
+			local mine = tag.name == "my_havoc_order" or tag.name == "havoc_order_threshold_6"
+
+			lines[#lines + 1] = string.format("%s%s | rootTag=%s locked=%s parents=%s", mine and "* " or "  ", tostring(tag.name), tostring(tag.rootTag), tostring(tag.locked), table.concat(parents_map[tag.name] or {}, ","))
+		end
+	end
+
+	return lines
+end
+
+local function verify_write()
+	local entries = _verify.entries or {}
+	local mine = _verify.party_id
+	local lines = {}
+	local found = false
+
+	lines[#lines + 1] = "myhavoc /havocgroup check 结果"
+	lines[#lines + 1] = ""
+	lines[#lines + 1] = "region          = " .. tostring(_verify.region)
+	lines[#lines + 1] = "my party_id     = " .. tostring(mine)
+	lines[#lines + 1] = "advertise_state = " .. error_text(_verify.state)
+	lines[#lines + 1] = "list count      = " .. tostring(#entries)
+
+	for i = 1, #entries do
+		local entry = entries[i]
+		local is_mine = entry.party_id == mine
+
+		if is_mine then
+			found = true
+		end
+
+		lines[#lines + 1] = string.format("[%d] party_id = %s%s", i, tostring(entry.party_id), is_mine and "   <<== 自己" or "")
+		lines[#lines + 1] = "    tags = " .. table.concat(entry.tags or {}, ", ")
+
+		local config = entry.config or {}
+		local keys = {}
+
+		for key in pairs(config) do
+			keys[#keys + 1] = tostring(key)
+		end
+
+		table.sort(keys)
+
+		for _, key in ipairs(keys) do
+			lines[#lines + 1] = "    config." .. key .. " = " .. tostring(config[key])
+		end
+	end
+
+	for _, line in ipairs(verify_tag_lines()) do
+		lines[#lines + 1] = line
+	end
+
+	_verify.found = found
+	dump_verify(table.concat(lines, "\n") .. "\n")
+end
+
+local function verify_tick(dt)
+	if not _verify.active then
+		return
+	end
+
+	_verify.t = _verify.t + (dt or 0)
+
+	local ok, events = pcall(function ()
+		return Managers.grpc:get_party_finder_list_advertisements_events(tostring(_verify.stream_id))
+	end)
+
+	if ok and type(events) == "table" then
+		for i = 1, #events do
+			local event = events[i]
+
+			if type(event) == "table" and event.type == "advertisement_entries_update" and type(event.entries) == "table" then
+				_verify.entries = event.entries
+			end
+		end
+	end
+
+	if _verify.t >= VERIFY_SECONDS then
+		_verify.active = false
+
+		pcall(function ()
+			Managers.grpc:abort_operation(_verify.stream_id)
+		end)
+		verify_write()
+		mod:echo(mod:localize(_verify.found and "verify_found" or "verify_missing", #(_verify.entries or {})))
+	end
+end
+
+-- 计时全靠这个钩子：DMF 没有定时器 API，但自己就在 hook CLASS.InputManager.update
+-- （dmf_hooks.lua L575），说明这个类在任何场景（枢纽站/任务中）都在每帧跑
+local _verify_ticker_registered = false
+
+-- 计时全靠公共每帧钩子（DMF 没有定时器 API；CLASS.InputManager.update 到处都是）
+local function verify_install_hook()
+	if not _verify_ticker_registered then
+		_verify_ticker_registered = true
+		_tickers[#_tickers + 1] = verify_tick
+	end
+
+	return frame_hook_install()
+end
+
+local function check_group_advertise()
+	local party = Managers.party_immaterium
+
+	if not (party and party.party_id) then
+		mod:echo(mod:localize("err_no_service"))
+
+		return
+	end
+
+	if not verify_install_hook() then
+		mod:echo(mod:localize("verify_no_hook"))
+
+		return
+	end
+
+	_verify.entries = nil
+	_verify.tag_list = nil
+	_verify.t = 0
+	_verify.active = false
+	_verify.party_id = party:party_id()
+	_verify.state = party.advertise_state and party:advertise_state() or nil
+
+	-- 顺便把标签表抓下来（能不能加根父标签看它）
+	local social = Managers.data_service and Managers.data_service.social
+
+	if social and social.get_group_finder_tags then
+		local ok_tags, tags_promise = pcall(function ()
+			return social:get_group_finder_tags()
+		end)
+
+		if ok_tags and tags_promise then
+			tags_promise:next(function (data)
+				_verify.tag_list = data and data.tags and data.tags.tags or nil
+
+				verify_write()
+			end)
+		end
+	end
+
+	resolve_region(function (region)
+		_verify.region = region
+
+		local ok, promise, stream_id = pcall(function ()
+			return Managers.grpc:party_finder_list_advertisements_stream(region, {})
+		end)
+
+		if not (ok and promise and stream_id) then
+			mod:echo(mod:localize("verify_failed"))
+
+			return
+		end
+
+		_verify.stream_id = stream_id
+		_verify.active = true
+
+		mod:echo(mod:localize("verify_started", VERIFY_SECONDS))
+	end)
+end
+
+-- /havocgroup        按自己的浩劫订单创建组队房间
+-- /havocgroup cancel 关闭自己的招募
+-- /havocgroup check  回查后端列表里有没有自己的招募（诊断用）
+local function run_havoc_group(...)
+	local sub = parse_command_args(...)
+
+	if sub == "" or sub == "create" then
+		create_group_advertise()
+	elseif sub == "cancel" then
+		cancel_group_advertise()
+	elseif sub == "check" then
+		check_group_advertise()
+	else
+		-- 带上收到的参数：这样下一回截图/回话就能直接分清
+		-- 「跑到用法分支了」还是「跑到别的分支/旧代码」
+		mod:echo(mod:localize("usage_group", sub))
+	end
+end
+
+mod:command("havocgroup", mod:localize("command_description_group"), run_havoc_group)

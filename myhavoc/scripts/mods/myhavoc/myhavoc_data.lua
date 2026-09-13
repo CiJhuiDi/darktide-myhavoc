@@ -20,6 +20,11 @@ mod_data.options = {
             default_value = true,
         },
         {
+            setting_id = "group_open_view_after_create",
+            type = "checkbox",
+            default_value = true,
+        },
+        {
             setting_id = "debug_mode",
             type = "checkbox",
             default_value = false,
