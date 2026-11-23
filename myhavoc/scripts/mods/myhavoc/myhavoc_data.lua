@@ -15,11 +15,6 @@ mod_data.options = {
             default_value = true,
         },
         {
-            setting_id = "auto_send_only_if_changed",
-            type = "checkbox",
-            default_value = true,
-        },
-        {
             setting_id = "group_open_view_after_create",
             type = "checkbox",
             default_value = true,

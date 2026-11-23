@@ -1,7 +1,7 @@
 --[[
     Name: myhavoc
     Author: CiJhuiDi
-    Version: 1.1.0
+    Version: 1.3.7
 
     聊天命令 /myhavoc:把自己的当前浩劫(Havoc)任务(层数 + 地图 + 词条)发到聊天,
     方便向队友展示本周浩劫任务。
@@ -10,7 +10,7 @@
              (与 Havoc Auspex / Havoc Auspex Transmitter 同源,参考 Wobin 的开源实现)
     词条名:circumstance_templates 的 ui.display_name 本地化(官方中文/英文随游戏语言)
     地图名:mission_templates 的 mission_name 本地化
-    发送:Managers.chat:send_channel_message,优先 PARTY 频道,其次 MISSION,最后 HUB
+    发送:Managers.chat:send_channel_message,优先 MISSION,其次有效的 PARTY(真组队时),最后 HUB
 --]]
 
 local mod = get_mod("myhavoc")
@@ -105,21 +105,73 @@ local function build_message(order)
         :gsub("{mods}", mods_text)
 end
 
--- 找可发送的聊天频道:优先队伍(PARTY),其次任务(MISSION),最后枢纽(HUB)
+-- 我是否真的在一支队伍里。
+-- "打击小队"(PARTY) 频道很容易变成**孤儿死频道**：一个人、party_id 为空，本地却还挂着
+-- 上一次任务的 Strike Team 标签（PartyChatFix 的文档专门描述这个 bug：
+-- "a 'Strike Team' tab from a previous mission"）。往这种频道发消息不会报错，
+-- 但谁也收不到 —— 包括发消息的自己。
+local function myself_in_party()
+    local ok, in_party = pcall(function ()
+        local pm = Managers.party_immaterium
+
+        if not pm then
+            return false
+        end
+
+        local party_id = pm.party_id and pm:party_id()
+
+        if not party_id or party_id == "" then
+            return false
+        end
+
+        local count = 0
+
+        for _ in pairs(pm:all_members() or {}) do
+            count = count + 1
+        end
+
+        return count >= 2
+    end)
+
+    return ok and in_party == true
+end
+
+-- 找可发送的聊天频道：任务(MISSION) → 队伍(PARTY，且必须真的在队伍里) → 枢纽(HUB)
+-- HUB 必须排在 PARTY 后面：枢纽站里组着队时 HUB 频道同样存在，先挑 HUB 就会把
+-- 播报发进全站公共频道（2026-11-20 用户反馈"地图展示默认发到大厅频道了"）。
+-- 但也不能盲选 PARTY：它可能是孤儿死频道（单人、party_id 为空，本地却还挂着上一次
+-- 任务的 Strike Team 标签）。往这种频道发消息不报错，但谁也收不到 —— 包括自己
+-- （2026-10-13 实测），所以 PARTY 要先过 myself_in_party()。
 local function find_channel_handle(chat)
     local sessions = chat:sessions()
-    local fallback
+    local party, mission, hub
+
     for handle, channel in pairs(sessions) do
         local tag = channel.tag
+
         if tag == "PARTY" then
-            return handle
+            party = party or handle
         elseif tag == "MISSION" then
-            fallback = fallback or handle
-        elseif tag == "HUB" and not fallback then
-            fallback = handle
+            mission = mission or handle
+        elseif tag == "HUB" and not hub then
+            hub = handle
         end
     end
-    return fallback
+
+    if mission then
+        return mission
+    end
+
+    if party and myself_in_party() then
+        return party
+    end
+
+    if hub then
+        return hub
+    end
+
+    -- 兜底：只剩这个频道了。send_my_havoc 里的本地回显保证自己一定看得到。
+    return party
 end
 
 -- 发消息到聊天;成功返回 true
@@ -200,7 +252,10 @@ local function send_my_havoc(hooks)
             local message = build_message(payload)
 
             if send_to_chat(message) then
-                -- 聊天栏里本来就能看到消息本身，这句回显只在调试模式下输出
+                -- 这句属于"冗余/自动回显"，按设计归 debug_mode 管
+                -- （见 localization 的 debug_mode_description）。
+                -- 2026-10-13 曾为排查"发送成功但玩家看不到"临时改成始终显示
+                -- （mod:echo）；频道问题查清并加固后已改回 echo_debug。
                 echo_debug(mod:localize("sent") .. " " .. message)
 
                 if type(hooks) == "table" and type(hooks.done) == "function" then
@@ -297,8 +352,14 @@ mod:command("myhavoc", mod:localize("command_description"), command_send_order)
 -- 打完一局队伍还在，顺手把（可能已刷新的）浩劫订单贴到聊天，省得每次手打 /myhavoc。
 -- 触发：结算画面(EndView)出现后等 AUTO_SEND_DELAY 秒再发（等后端结算新订单）；
 --       提前离开结算画面时由 on_exit 立即发（兜底）。
--- 开关：auto_send_after_mission（默认开）；auto_send_only_if_changed（默认开，订单没变不刷屏）
+-- 开关：auto_send_after_mission（默认开）。胜利局一律播报，**不再按订单是否变化去重**
+--       （2026-10-13 用户定：层数封顶时后端不刷新订单，去重会把"赢了"的那条吞掉）
 -- 只在**浩劫局**结束后发：普通任务结束同样会进 EndView，但那时订单没变，发了就是刷屏
+-- **并且只在打过的局发**（2026-10-12 改）：
+--   实测（dt-cli 抓的同一台机器数据）：19:15 订单是 hm_complex + 颅部腐坏，
+--   19:39 那局结束后后端已重掷成 hm_cartel + 骇人听闻的仪式 —— 层数仍是 40。
+--   即"订单变了"判定次次成立，胜负都一样 → 每局都播报。
+--   用户要的是"过了才广播"，所以这里读 EndView._round_won。
 
 local AUTO_SEND_DELAY = 6
 
@@ -388,19 +449,20 @@ local function auto_send_run()
         return
     end
 
-    send_my_havoc({
-        filter = function (signature)
-            if mod:get("auto_send_only_if_changed") == false then return true end
+    -- 只在任务成功时播报（2026-10-12 用户定）。
+    -- 失败局后端会重掷订单（地图/词条换一批、层数不动），但层数没推进，
+    -- 播报给队友只是噪音，所以失败局一律不发。
+    if mod._auto_round_won ~= true then
+        echo_debug(mod:localize("auto_send_not_victory") .. " (won=" .. tostring(mod._auto_round_won) .. ")")
 
-            return mod._auto_last_sig ~= signature
-        end,
-        skip = function ()
-            echo_debug(mod:localize("auto_send_unchanged"))
-        end,
-        done = function (signature)
-            mod._auto_last_sig = signature
-        end,
-    })
+        return
+    end
+
+    -- 胜利就播报，**不再按"订单是否变化"去重**（2026-10-13 用户定）。
+    -- 原因：层数封顶（40）时，打过了后端也可能不刷新订单 —— 实测同一局结束后
+    --   current_order() = available_orders() = 同一个 order id（rank 40 / cm_habs / 同三词条），
+    -- 于是旧的去重把播报吞掉，用户看到的现象就是"赢了却没发下一张地图"。
+    send_my_havoc()
 end
 
 -- EndView 上的三个 hook 各自 pcall：任何一个方法不存在都不影响其余两个
@@ -408,12 +470,25 @@ local function try_hook_endview(method, handler)
     pcall(function () mod:hook_safe(CLASS.EndView, method, handler) end)
 end
 
-try_hook_endview("on_enter", function ()
+-- 本局胜负：EndView._round_won 在 init 里按 context.round_won 设好（end_view.lua L40），
+-- 成功失败都会进 EndView，只有这个字段能区分。拿不到就保持原值（nil 视作"没打过"，不播）。
+local function capture_round_won(view)
+    if view and view._round_won ~= nil then
+        mod._auto_round_won = view._round_won and true or false
+    end
+end
+
+try_hook_endview("on_enter", function (self)
     mod._auto_fired = false
     mod._auto_t = 0
+
+    capture_round_won(self)
 end)
 
 try_hook_endview("update", function (self, dt, ...)
+    -- 每帧兜底刷一次：on_enter 那一下可能被 DMF 的延迟安装错过（"needs to be delayed"）
+    capture_round_won(self)
+
     if mod._auto_fired then return end
 
     mod._auto_t = (mod._auto_t or 0) + (dt or 0)
@@ -423,7 +498,9 @@ try_hook_endview("update", function (self, dt, ...)
     end
 end)
 
-try_hook_endview("on_exit", function ()
+try_hook_endview("on_exit", function (self)
+    capture_round_won(self)
+
     auto_send_run()
 end)
 
@@ -670,10 +747,22 @@ local function dump_group_error(error, config, tags, region)
 		local ok_leader, is_leader = pcall(function ()
 			return party.is_party_leader and party:is_party_leader() or "n/a"
 		end)
+		-- 人数同样走 all_members()（num_members() 不存在，写出来永远是 nil）
+		local member_count = "n/a"
+		pcall(function ()
+			local members = party and party:all_members()
+			local count = 0
+
+			for _ in pairs(members or {}) do
+				count = count + 1
+			end
+
+			member_count = count
+		end)
 
 		file:write("party_id        = " .. tostring(party and party:party_id()) .. "\n")
 		file:write("is_party_leader = " .. (ok_leader and tostring(is_leader) or "ERR") .. "\n")
-		file:write("num_members     = " .. tostring(party and party.num_members and party:num_members()) .. "\n")
+		file:write("num_members     = " .. tostring(member_count) .. "\n")
 		file:write("presence        = " .. tostring(party and party:get_myself() and party:get_myself():presence_name()) .. "\n")
 		file:close()
 	end)
@@ -897,7 +986,13 @@ end
 --   之后几次因为关卡已在内存里、没有这个卡顿，所以都正常 —— 这就是「只有第一次」的来源。
 --
 -- 做法：挂到下一帧再开 → 开完验证真的 active → 没成就在超时窗口内限流重试 →
---      **开成之后还要守一会儿**：被关掉就再开（最多 GROUP_FINDER_MAX_REOPENS 次）
+--      **开成之后守 0.8 秒**：被游戏关掉就补开（最多 GROUP_FINDER_MAX_REOPENS 次）。
+--        这一步**不能省** —— 重启游戏后首次打开会被 group_finder 关卡加载的卡顿
+--        带崩，界面闪一下就没了（2026-09-14 用户反馈；2026-10-12 我误删过一次又补回）。
+--      但**绝不强制 close 正在关闭的界面**：强关会让界面立刻销毁重建
+--        （UIWidget.destroy + 立刻 init，group_finder_view._init_own_group_presentation
+--         就是这么干的），成员的 insignia 图标包被 unload 后 renderer 还在画 →
+--        resource_manager.cpp:612 断言 refcount == 0 崩溃（2026-10-12 实崩）。
 --      → 彻底失败则明确提示 + 落盘诊断，不再静默。
 local GROUP_FINDER_OPEN_TIMEOUT = 5
 local GROUP_FINDER_WATCH_SECONDS = 0.8
@@ -1000,11 +1095,9 @@ local function finder_open_step()
 		return true
 	end
 
-	-- 正在关闭：先强制关掉，下一拍再开
+	-- 正在关闭：等它自己关完，**绝不**再强制 close_view（见上方 2026-10-12 复盘）
 	if state.closing then
-		pcall(function ()
-			Managers.ui:close_view(GROUP_FINDER_VIEW, true)
-		end)
+		finder_log_push("  ~ 界面正在关闭，等它关完（不强制关）")
 
 		return false
 	end
@@ -1058,13 +1151,18 @@ local function finder_open_tick(dt)
 
 			finder_log_push("  ^ 首次打开")
 		elseif not active_before then
-			-- 之前开成过，这一拍发现它没了 → 重开
+			-- 之前开成过、这一拍发现它没了 → 再开一次。
+			-- 实测（2026-09-14 用户反馈）：重启游戏后首次打开，界面会被 group_finder
+			-- 关卡加载的卡顿带崩 —— 闪一下就没了，所以必须补开。
 			_open_finder.reopens = _open_finder.reopens + 1
 
 			finder_log_push(string.format("  ^ 被关掉了，重开第 %d 次", _open_finder.reopens))
 		end
 
-		-- 守着：窗口内继续看它还在不在（首次那一下会被关卡加载的卡顿带崩，重开一次就好了）
+		-- 守着：窗口内继续看它还在不在（被关掉就重开，最多 MAX_REOPENS 次）。
+		-- 与旧版的唯一区别：**绝不强制 close_view** —— 强关会让界面立刻销毁重建，
+		-- 触发 insignia 图标资源的 load/unload 竞态（2026-10-12 崩溃复盘）；
+		-- 正在关闭时 finder_open_step 只是等它关完，不插手。
 		local watching = (_open_finder.t - (_open_finder.opened_t or 0)) < GROUP_FINDER_WATCH_SECONDS
 		local can_reopen = _open_finder.reopens < GROUP_FINDER_MAX_REOPENS
 
@@ -1105,6 +1203,35 @@ end
 
 _tickers[#_tickers + 1] = finder_open_tick
 
+-- 队伍满员（4/4）判定
+-- 原版 UI 在满员时会禁用「开始招募」按钮（group_finder_view：
+--   start_group_button.content.hotspot.disabled = is_party_full or ...，
+--   is_party_full = num_party_members >= 4），
+-- 绕过它直接调 start_party_finder_advertise 会把寻找队伍界面推进 advertising 状态，
+-- 并在重建自己的队伍面板时崩在 insignia 图标资源卸载上
+-- （2026-10-12 崩溃复盘：resource_manager.cpp:612 断言 refcount == 0，
+--   reference holders = UIWidget.draw->GroupFinderView_ui_renderer，
+--   package = content/ui/textures/nameplates/insignias/insignia_hestia_01_04，
+--   reference_name = ItemIconLoaderUI）。
+-- 而且满员时招募本来也没人加得进来，直接拦掉。
+local function party_is_full()
+	local ok, num_members = pcall(function ()
+		-- 注意：PartyImmateriumManager **没有** num_members()（2026-10-12 实测为 nil，
+		-- 一度让这里的判定永远返回 false）。all_members() 才是可靠来源，
+		-- 且**包含自己**：实测队伍 2 人时返回 2 条、其中一条 account_id 就是本机账号。
+		local members = Managers.party_immaterium and Managers.party_immaterium:all_members()
+		local count = 0
+
+		for _ in pairs(members or {}) do
+			count = count + 1
+		end
+
+		return count
+	end)
+
+	return ok and type(num_members) == "number" and num_members >= 4
+end
+
 -- 一键创建
 local function create_group_advertise()
 	local party = Managers.party_immaterium
@@ -1117,6 +1244,13 @@ local function create_group_advertise()
 
 	if not myself_in_hub() then
 		mod:echo(mod:localize("group_not_in_hub"))
+
+		return
+	end
+
+	-- 满员时不许创建（原版按钮此时是禁用的，见 party_is_full 注释）
+	if party_is_full() then
+		mod:echo(mod:localize("group_party_full"))
 
 		return
 	end
@@ -1407,6 +1541,167 @@ local function check_group_advertise()
 		mod:echo(mod:localize("verify_started", VERIFY_SECONDS))
 	end)
 end
+
+-- ########################## 退队并重建房间（/havocregroup） ##########################
+-- 用途：队伍乱了，想按自己的浩劫订单重新开一间。
+-- 暗潮的队伍没有严格意义上的队长（is_party_leader 只是个标记，退队/建房都不需要它），
+-- 所以这里不判断「我是不是队长」——一律先离开当前队伍，再建新房间。
+--
+-- leave_party() 的实现（party_immaterium_manager.lua L432-468）：
+--   gRPC leave_party(旧 party_id) → join_party("") 建一个只有自己的新队伍
+-- promise 回来时 _party_connection 已经是新队伍，party_id() 也是新的；
+-- 但界面/后端还要一拍才同步，所以等 REGROUP_SETTLE 秒再创建。
+local REGROUP_SETTLE = 1.5
+local REGROUP_TIMEOUT = 15
+
+local _regroup = { busy = false, busy_t = 0, pending = false, t = 0 }
+
+local function regroup_tick(dt)
+	dt = dt or 0
+
+	-- 兜底：leave_party 的 promise 万一不回来，别把命令永久锁死
+	if _regroup.busy and not _regroup.pending then
+		_regroup.busy_t = _regroup.busy_t + dt
+
+		if _regroup.busy_t >= REGROUP_TIMEOUT then
+			_regroup.busy = false
+			_regroup.busy_t = 0
+			mod:echo(mod:localize("regroup_leave_failed"))
+		end
+	end
+
+	if not _regroup.pending then
+		return
+	end
+
+	_regroup.t = _regroup.t + dt
+
+	if _regroup.t < REGROUP_SETTLE then
+		return
+	end
+
+	_regroup.pending = false
+	_regroup.busy = false
+	_regroup.busy_t = 0
+	create_group_advertise()
+end
+
+_tickers[#_tickers + 1] = regroup_tick
+
+-- 排进 ticker，等队伍状态落定后再建房
+local function regroup_schedule_create()
+	if not frame_hook_install() then
+		-- 装不上每帧钩子就当场建，成不成随它
+		_regroup.busy = false
+		create_group_advertise()
+
+		return
+	end
+
+	_regroup.pending = true
+	_regroup.t = 0
+end
+
+-- 退队，成功后在 next 里排建房
+local function regroup_leave_then_create(party)
+	local ok, promise = pcall(function ()
+		return party:leave_party()
+	end)
+
+	if not (ok and promise and type(promise.next) == "function") then
+		_regroup.busy = false
+		mod:echo(mod:localize("regroup_leave_failed"))
+
+		return
+	end
+
+	echo_debug(mod:localize("regroup_leaving"))
+
+	promise:next(function ()
+		echo_debug(mod:localize("regroup_rebuilding"))
+		regroup_schedule_create()
+	end):catch(function (error)
+		_regroup.busy = false
+		mod:echo(mod:localize("regroup_leave_failed") .. " " .. error_text(error))
+	end)
+end
+
+local function regroup_go(party, need_leave)
+	if need_leave then
+		regroup_leave_then_create(party)
+	else
+		echo_debug(mod:localize("regroup_rebuilding"))
+		regroup_schedule_create()
+	end
+end
+
+local function regroup_havoc()
+	local party = Managers.party_immaterium
+
+	if not (party and party.leave_party and party.start_party_finder_advertise) then
+		mod:echo(mod:localize("err_no_service"))
+
+		return
+	end
+
+	if not myself_in_hub() then
+		mod:echo(mod:localize("group_not_in_hub"))
+
+		return
+	end
+
+	if _regroup.busy then
+		mod:echo(mod:localize("regroup_busy"))
+
+		return
+	end
+
+	-- 人数：all_members() 含自己（与 party_is_full 同一来源）
+	local count = 0
+	pcall(function ()
+		for _ in pairs(party:all_members() or {}) do
+			count = count + 1
+		end
+	end)
+
+	local need_leave = count >= 2
+	local advertising = party.is_party_advertisement_active and party:is_party_advertisement_active()
+
+	_regroup.busy = true
+	_regroup.busy_t = 0
+
+	-- 在招募中：先关掉。否则建房会撞上「已在进行中」那条分支，
+	-- 结果是打开界面而不是重建。
+	if advertising and party.cancel_party_finder_advertise then
+		local ok, promise = pcall(function ()
+			return party:cancel_party_finder_advertise()
+		end)
+
+		if ok and promise and type(promise.next) == "function" then
+			promise:next(function ()
+				regroup_go(party, need_leave)
+			end):catch(function ()
+				regroup_go(party, need_leave)
+			end)
+
+			return
+		end
+	end
+
+	regroup_go(party, need_leave)
+end
+
+local function command_regroup(...)
+	local _, raw = parse_command_args(...)
+
+	if reject_extra_args(raw, "usage_regroup") then
+		return
+	end
+
+	regroup_havoc()
+end
+
+mod:command("havocregroup", mod:localize("command_description_regroup"), command_regroup)
 
 -- /havocgroup        按自己的浩劫订单创建组队房间
 -- /havocgroup cancel 关闭自己的招募
